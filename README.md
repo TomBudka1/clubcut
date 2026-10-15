@@ -13,6 +13,14 @@ npm run dev
 
 Open the local URL printed by Vite. The development server sets the cross-origin isolation headers required by the FFmpeg worker. The first export downloads the FFmpeg core from jsDelivr, so an internet connection is required for that first load.
 
+## Games split across several files
+
+Many cameras start a new file every ~4 GB or ~12 minutes, and some teams record each half separately. Select or drop all of the MP4s at once. ClubCut sorts them by filename, which keeps camera chapter order such as GH010042, GH020042, and plays them back to back as one game. Use the arrows on each file in the **Footage** bar to fix the order, the × to remove a file, or **Add file** to append more. Dashed orange lines on the timeline mark where one file ends and the next begins.
+
+Auto-cut scans every file, and plays that cross a file break are handled automatically at export. With no plays marked, **Export joined** combines the files into one full-length MP4.
+
+Fast export joins files without re-encoding, which works when they come from the same camera at the same settings. If the files come from different cameras or resolutions, turn on **Frame-accurate**.
+
 ## Cutting dead time automatically
 
 1. Choose an MP4 using **Add game footage**.

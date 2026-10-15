@@ -35,7 +35,27 @@ function seekTo(video: HTMLVideoElement, time: number, signal: AbortSignal) {
   })
 }
 
-export async function analyzeActivity(file: File, onProgress: (fraction: number) => void, signal: AbortSignal): Promise<ActivityTrack> {
+// Scans every file in order and joins the results into one activity track covering the whole game.
+export async function analyzeActivity(footage: { file: File; duration: number }[], onProgress: (fraction: number) => void, signal: AbortSignal): Promise<ActivityTrack> {
+  const duration = footage.reduce((total, part) => total + part.duration, 0)
+  // One sample per second is plenty for a full game; shorter clips get finer detail.
+  const interval = duration > 1800 ? 1 : 0.5
+  const counts = footage.map((part) => Math.max(2, Math.round(part.duration / interval)))
+  const scores = new Float32Array(counts.reduce((total, count) => total + count, 0))
+
+  let offset = 0
+  for (let index = 0; index < footage.length; index += 1) {
+    const start = offset
+    const count = counts[index]
+    await scanFile(footage[index].file, interval, scores.subarray(start, start + count), (fraction) => onProgress((start + fraction * count) / scores.length), signal)
+    offset += count
+  }
+
+  onProgress(1)
+  return { duration, interval, scores }
+}
+
+async function scanFile(file: File, interval: number, scores: Float32Array, onProgress: (fraction: number) => void, signal: AbortSignal) {
   const url = URL.createObjectURL(file)
   const video = document.createElement('video')
   video.muted = true
@@ -45,14 +65,12 @@ export async function analyzeActivity(file: File, onProgress: (fraction: number)
   try {
     await new Promise<void>((resolve, reject) => {
       video.onloadeddata = () => resolve()
-      video.onerror = () => reject(new Error('This MP4 could not be decoded by your browser.'))
+      video.onerror = () => reject(new Error(`${file.name} could not be decoded by your browser.`))
       video.src = url
     })
 
     const duration = video.duration
-    // One sample per second is plenty for a full game; shorter clips get finer detail.
-    const interval = duration > 1800 ? 1 : 0.5
-    const count = Math.max(2, Math.floor(duration / interval))
+    const count = scores.length
     const canvas = document.createElement('canvas')
     canvas.width = FRAME_WIDTH
     canvas.height = FRAME_HEIGHT
@@ -60,7 +78,6 @@ export async function analyzeActivity(file: File, onProgress: (fraction: number)
     if (!context) throw new Error('Your browser blocked the canvas needed to scan video frames.')
 
     const pixels = FRAME_WIDTH * FRAME_HEIGHT
-    const scores = new Float32Array(count)
     let previous = new Uint8Array(pixels)
     let current = new Uint8Array(pixels)
 
@@ -81,9 +98,8 @@ export async function analyzeActivity(file: File, onProgress: (fraction: number)
       if (index % 5 === 0) onProgress(index / count)
     }
 
+    // The first frame of a file has nothing to compare against, so borrow its neighbour's score.
     scores[0] = scores[1]
-    onProgress(1)
-    return { duration, interval, scores }
   } finally {
     video.removeAttribute('src')
     video.load()

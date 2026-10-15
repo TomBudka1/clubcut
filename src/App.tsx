@@ -1,15 +1,16 @@
 import { useMemo, useRef, useState, type MouseEvent } from 'react'
-import { ArrowDown, ArrowUp, Check, ChevronDown, Clapperboard, Clock3, Download, Film, Flag, FolderOpen, LoaderCircle, Pause, Play, Plus, ScanLine, Scissors, SkipForward, Sparkles, Trash2, Upload, Volume2, X } from 'lucide-react'
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, ChevronDown, Clapperboard, Clock3, Download, Film, Flag, FolderOpen, LoaderCircle, Pause, Play, Plus, ScanLine, Scissors, SkipForward, Sparkles, Trash2, Upload, Volume2, X } from 'lucide-react'
 import { FFmpeg, FFFSType } from '@ffmpeg/ffmpeg'
 import { fetchFile, toBlobURL } from '@ffmpeg/util'
 import { activityProfile, analyzeActivity, findPlays, smoothActivity, type ActivityTrack, type Range } from './deadTime'
+import { locate, probeDuration, sortByName, splitRange, withOffsets, type Piece, type Source } from './footage'
 
 type PlayTag = 'Live' | 'Scoring' | 'Defense' | 'Transition' | 'Skill'
 type Clip = { id: string; title: string; start: number; end: number; tag: PlayTag }
 
 const tags: PlayTag[] = ['Live', 'Scoring', 'Defense', 'Transition', 'Skill']
 const tagClass: Record<PlayTag, string> = { Live: 'live', Scoring: 'scoring', Defense: 'defense', Transition: 'transition', Skill: 'skill' }
-const OUTPUT_NAME = 'clubcut_highlights.mp4'
+const OUTPUT_NAME = 'clubcut_output.mp4'
 
 function pad(value: number) {
   return String(value).padStart(2, '0')
@@ -32,25 +33,33 @@ function formatEta(seconds: number) {
   return seconds < 60 ? `about ${Math.ceil(seconds)}s left` : `about ${Math.ceil(seconds / 60)} min left`
 }
 
-// Mounting reads the file lazily, so multi-gigabyte games never have to be copied into FFmpeg's memory.
-async function mountSource(ffmpeg: FFmpeg, source: File) {
+function isMp4(file: File) {
+  return file.name.toLowerCase().endsWith('.mp4') || file.type === 'video/mp4'
+}
+
+// Mounting reads the files lazily, so multi-gigabyte games never have to be copied into FFmpeg's memory.
+async function mountSources(ffmpeg: FFmpeg, sources: Source[]) {
+  const names = sources.map((_, index) => `source${index}.mp4`)
   try {
     await ffmpeg.createDir('/input')
-    await ffmpeg.mount(FFFSType.WORKERFS, { files: [new File([source], 'source.mp4', { type: 'video/mp4' })] }, '/input')
-    return '/input/source.mp4'
+    await ffmpeg.mount(FFFSType.WORKERFS, { files: sources.map((source, index) => new File([source.file], names[index], { type: 'video/mp4' })) }, '/input')
+    return names.map((name) => `/input/${name}`)
   } catch {
-    await ffmpeg.writeFile('source.mp4', await fetchFile(source))
-    return 'source.mp4'
+    for (let index = 0; index < sources.length; index += 1) await ffmpeg.writeFile(names[index], await fetchFile(sources[index].file))
+    return names
   }
 }
 
 export default function App() {
   const fileInput = useRef<HTMLInputElement>(null)
+  const appendInput = useRef<HTMLInputElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const analysisAbort = useRef<AbortController | null>(null)
-  const [file, setFile] = useState<File | null>(null)
-  const [videoUrl, setVideoUrl] = useState('')
-  const [duration, setDuration] = useState(0)
+  // Where to jump once the next file's video element has loaded.
+  const pendingSeek = useRef<{ local: number; play: boolean } | null>(null)
+  const [sources, setSources] = useState<Source[]>([])
+  const [activeIndex, setActiveIndex] = useState(0)
+  const [isLoadingFootage, setIsLoadingFootage] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [clips, setClips] = useState<Clip[]>([])
   const [selectedId, setSelectedId] = useState('')
@@ -67,38 +76,112 @@ export default function App() {
   const [strictness, setStrictness] = useState(0.45)
   const [leadIn, setLeadIn] = useState(2)
 
+  const active = sources[activeIndex] ?? null
+  const duration = sources.reduce((total, source) => total + source.duration, 0)
   const selectedClip = clips.find((clip) => clip.id === selectedId) ?? null
   const totalSelected = clips.reduce((total, clip) => total + Math.max(0, clip.end - clip.start), 0)
+  const canExport = sources.length > 0 && (clips.length > 0 || sources.length > 1)
 
   const smoothed = useMemo(() => track ? smoothActivity(track) : null, [track])
   const detection = useMemo(() => track && smoothed ? findPlays(track, smoothed, { strictness, leadIn }) : null, [track, smoothed, strictness, leadIn])
   const profile = useMemo(() => smoothed && detection ? activityProfile(smoothed, detection.threshold) : null, [smoothed, detection])
   const detectedTotal = detection?.plays.reduce((total, play) => total + play.end - play.start, 0) ?? 0
 
-  function openVideo(nextFile?: File) {
-    const chosenFile = nextFile ?? fileInput.current?.files?.[0]
-    if (!chosenFile) return
-    if (!chosenFile.name.toLowerCase().endsWith('.mp4') && chosenFile.type !== 'video/mp4') {
-      setErrorMessage('Choose an MP4 video file.')
-      return
-    }
+  // Plays are stored in game time, so they stay valid when files are appended but not when files move.
+  function setFootage(next: Source[], keepPlays: boolean) {
     analysisAbort.current?.abort()
-    if (videoUrl) URL.revokeObjectURL(videoUrl)
-    setFile(chosenFile)
-    setVideoUrl(URL.createObjectURL(chosenFile))
-    setClips([])
-    setSelectedId('')
-    setDuration(0)
-    setCurrentTime(0)
+    pendingSeek.current = null
+    setSources(next)
     setTrack(null)
-    setSkipDeadTime(false)
     setErrorMessage('')
     setExportMessage('')
+    if (!keepPlays) {
+      setActiveIndex(0)
+      setCurrentTime(0)
+      setIsPlaying(false)
+      setClips([])
+      setSelectedId('')
+      setSkipDeadTime(false)
+    }
   }
 
-  function seek(time: number) {
-    if (videoRef.current) videoRef.current.currentTime = time
+  async function addFootage(list: FileList | File[] | null | undefined, append: boolean) {
+    const chosen = Array.from(list ?? [])
+    if (fileInput.current) fileInput.current.value = ''
+    if (appendInput.current) appendInput.current.value = ''
+    if (!chosen.length) return
+    const videos = sortByName(chosen.filter(isMp4))
+    if (videos.length < chosen.length) {
+      setErrorMessage(videos.length ? 'Skipped files that are not MP4s.' : 'Choose MP4 video files.')
+      if (!videos.length) return
+    }
+    setIsLoadingFootage(true)
+    try {
+      const added = await Promise.all(videos.map(async (file) => ({ id: crypto.randomUUID(), file, duration: await probeDuration(file), url: URL.createObjectURL(file) })))
+      if (!append) sources.forEach((source) => URL.revokeObjectURL(source.url))
+      setFootage(withOffsets([...(append ? sources : []), ...added]), append)
+      if (append && clips.length) setExportMessage(`Added ${added.length} ${added.length === 1 ? 'file' : 'files'} to the end. Run auto-cut again to find plays in the new footage.`)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Could not read that footage.')
+    } finally {
+      setIsLoadingFootage(false)
+    }
+  }
+
+  function moveSource(index: number, direction: -1 | 1) {
+    const target = index + direction
+    if (target < 0 || target >= sources.length) return
+    const reordered = [...sources]
+    ;[reordered[index], reordered[target]] = [reordered[target], reordered[index]]
+    setFootage(withOffsets(reordered), false)
+    if (clips.length) setExportMessage('Footage order changed, so plays were cleared. Run auto-cut again.')
+  }
+
+  function removeSource(index: number) {
+    URL.revokeObjectURL(sources[index].url)
+    setFootage(withOffsets(sources.filter((_, position) => position !== index)), false)
+  }
+
+  function seek(time: number, play = isPlaying) {
+    if (!sources.length) return
+    const clamped = Math.max(0, Math.min(duration, time))
+    const { index, local } = locate(sources, clamped)
+    setCurrentTime(clamped)
+    if (index === activeIndex && videoRef.current) {
+      videoRef.current.currentTime = local
+      return
+    }
+    pendingSeek.current = { local, play }
+    setActiveIndex(index)
+  }
+
+  function handleLoaded(video: HTMLVideoElement) {
+    const pending = pendingSeek.current
+    pendingSeek.current = null
+    if (!pending) return
+    video.currentTime = pending.local
+    if (pending.play) void video.play()
+  }
+
+  function handleEnded() {
+    if (activeIndex < sources.length - 1) {
+      pendingSeek.current = { local: 0, play: true }
+      setActiveIndex(activeIndex + 1)
+    } else {
+      setIsPlaying(false)
+    }
+  }
+
+  function handleTimeUpdate(video: HTMLVideoElement) {
+    if (!active) return
+    const time = active.offset + video.currentTime
     setCurrentTime(time)
+    if (!skipDeadTime || video.paused || clips.length === 0) return
+    const ordered = [...clips].sort((a, b) => a.start - b.start)
+    if (ordered.some((clip) => time >= clip.start && time < clip.end)) return
+    const next = ordered.find((clip) => clip.start > time)
+    if (next) seek(next.start, true)
+    else video.pause()
   }
 
   function applyPlays(plays: Range[]) {
@@ -110,7 +193,7 @@ export default function App() {
   }
 
   async function analyzeFootage() {
-    if (!file || analysisProgress !== null) return
+    if (!sources.length || analysisProgress !== null) return
     const controller = new AbortController()
     analysisAbort.current = controller
     const startedAt = performance.now()
@@ -119,7 +202,7 @@ export default function App() {
     setErrorMessage('')
     setExportMessage('')
     try {
-      const result = await analyzeActivity(file, (fraction) => {
+      const result = await analyzeActivity(sources, (fraction) => {
         setAnalysisProgress(fraction)
         const elapsed = (performance.now() - startedAt) / 1000
         setAnalysisEta(fraction > 0.02 ? formatEta((elapsed / fraction) * (1 - fraction)) : 'estimating…')
@@ -135,17 +218,6 @@ export default function App() {
       if (analysisAbort.current === controller) analysisAbort.current = null
       setAnalysisProgress(null)
     }
-  }
-
-  function handleTimeUpdate(video: HTMLVideoElement) {
-    const time = video.currentTime
-    setCurrentTime(time)
-    if (!skipDeadTime || video.paused || clips.length === 0) return
-    const ordered = [...clips].sort((a, b) => a.start - b.start)
-    if (ordered.some((clip) => time >= clip.start && time < clip.end)) return
-    const next = ordered.find((clip) => clip.start > time)
-    if (next) video.currentTime = next.start
-    else video.pause()
   }
 
   function seekFromStrip(event: MouseEvent<HTMLDivElement>) {
@@ -194,12 +266,17 @@ export default function App() {
   }
 
   async function exportCompilation() {
-    if (!file || !clips.length || isExporting) return
+    if (!canExport || isExporting) return
     setIsExporting(true)
     setExportProgress(0)
     setExportMessage('Preparing editor…')
     setErrorMessage('')
     const ffmpeg = new FFmpeg()
+    // With no plays marked, export joins every file end to end.
+    const joinOnly = clips.length === 0
+    const pieces: Piece[] = joinOnly
+      ? sources.map((source, index) => ({ index, start: 0, end: source.duration }))
+      : clips.flatMap((clip) => splitRange(sources, clip.start, clip.end))
 
     try {
       const base = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd'
@@ -209,37 +286,43 @@ export default function App() {
       })
       ffmpeg.on('progress', ({ progress }) => setExportProgress(Math.max(0, Math.min(99, Math.round(progress * 100)))))
       setExportMessage('Reading game film…')
-      const source = await mountSource(ffmpeg, file)
+      const paths = await mountSources(ffmpeg, sources)
 
       if (preciseExport) {
-        const clipFiles: string[] = []
-        for (let index = 0; index < clips.length; index += 1) {
-          const clip = clips[index]
-          const outputName = `play_${String(index).padStart(3, '0')}.mp4`
-          clipFiles.push(outputName)
-          setExportMessage(`Cutting play ${index + 1} of ${clips.length}…`)
+        const pieceFiles: string[] = []
+        for (let index = 0; index < pieces.length; index += 1) {
+          const piece = pieces[index]
+          const outputName = `piece_${String(index).padStart(3, '0')}.mp4`
+          pieceFiles.push(outputName)
+          setExportMessage(`Encoding part ${index + 1} of ${pieces.length}…`)
           const result = await ffmpeg.exec([
-            '-ss', clip.start.toFixed(3), '-i', source, '-t', (clip.end - clip.start).toFixed(3),
+            '-ss', piece.start.toFixed(3), '-i', paths[piece.index], '-t', (piece.end - piece.start).toFixed(3),
             '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-c:a', 'aac', '-b:a', '128k',
             '-movflags', '+faststart', outputName,
           ])
-          if (result !== 0) throw new Error(`Could not cut ${clip.title}. Check that the MP4 can be played in your browser.`)
+          if (result !== 0) throw new Error(`Could not encode part ${index + 1} from ${sources[piece.index].file.name}.`)
         }
 
-        const concatList = clipFiles.map((name) => `file '${name}'`).join('\n')
-        await ffmpeg.writeFile('plays.txt', new TextEncoder().encode(concatList))
-        setExportMessage('Joining your highlights…')
-        const result = await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'plays.txt', '-c', 'copy', '-movflags', '+faststart', OUTPUT_NAME])
-        if (result !== 0) throw new Error('The selected plays could not be joined into one video.')
+        const concatList = pieceFiles.map((name) => `file '${name}'`).join('\n')
+        await ffmpeg.writeFile('pieces.txt', new TextEncoder().encode(concatList))
+        setExportMessage('Joining everything into one video…')
+        const result = await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'pieces.txt', '-c', 'copy', '-movflags', '+faststart', OUTPUT_NAME])
+        if (result !== 0) throw new Error('The parts could not be joined into one video.')
       } else {
-        // Stream copy: no re-encoding, so a full game exports in about the time it takes to read the file.
+        // Stream copy: no re-encoding, so a full game exports in about the time it takes to read the files.
         // Cuts land on the nearest keyframe (usually within a second or two), which the lead-in absorbs.
-        const concatList = ['ffconcat version 1.0', ...clips.flatMap((clip) => [`file '${source}'`, `inpoint ${clip.start.toFixed(3)}`, `outpoint ${clip.end.toFixed(3)}`])].join('\n')
-        await ffmpeg.writeFile('plays.txt', new TextEncoder().encode(concatList))
-        setExportMessage(`Joining ${clips.length} ${clips.length === 1 ? 'play' : 'plays'}…`)
-        const result = await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'plays.txt', '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', OUTPUT_NAME])
-        if (result !== 0) throw new Error('Fast export failed for this file. Turn on "Frame-accurate" and export again.')
+        const concatList = ['ffconcat version 1.0', ...pieces.flatMap((piece) => joinOnly
+          ? [`file '${paths[piece.index]}'`]
+          : [`file '${paths[piece.index]}'`, `inpoint ${piece.start.toFixed(3)}`, `outpoint ${piece.end.toFixed(3)}`])].join('\n')
+        await ffmpeg.writeFile('pieces.txt', new TextEncoder().encode(concatList))
+        setExportMessage(joinOnly ? `Joining ${sources.length} files…` : `Joining ${clips.length} ${clips.length === 1 ? 'play' : 'plays'}…`)
+        const result = await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'pieces.txt', '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', OUTPUT_NAME])
+        if (result !== 0) {
+          throw new Error(sources.length > 1
+            ? 'Fast export failed. If these files came from different cameras or settings, turn on "Frame-accurate" and export again.'
+            : 'Fast export failed for this file. Turn on "Frame-accurate" and export again.')
+        }
       }
 
       const output = await ffmpeg.readFile(OUTPUT_NAME)
@@ -247,13 +330,13 @@ export default function App() {
       const downloadUrl = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = downloadUrl
-      link.download = `${file.name.replace(/\.mp4$/i, '')}_${skipDeadTime ? 'cut' : 'highlights'}.mp4`
+      link.download = `${sources[0].file.name.replace(/\.mp4$/i, '')}_${joinOnly ? 'full' : 'cut'}.mp4`
       link.click()
       window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 60_000)
       setExportProgress(100)
       setExportMessage('Video downloaded')
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : 'Export failed. Try a smaller MP4 or fewer plays.')
+      setErrorMessage(error instanceof Error ? error.message : 'Export failed. Try smaller files or fewer plays.')
       setExportMessage('Export stopped')
     } finally {
       await ffmpeg.terminate()
@@ -270,14 +353,14 @@ export default function App() {
         </a>
         <div className="project-label"><span className="live-dot" /> GAME DAY EDIT <span className="top-divider">/</span> <span className="muted">New project</span></div>
         <div className="top-actions">
-          {file && <span className="save-state"><Check size={13} /> Processed locally</span>}
+          {sources.length > 0 && <span className="save-state"><Check size={13} /> Processed locally</span>}
           <label className="export-mode" title="Re-encodes every play so cuts land on the exact frame. Much slower for full games.">
             <input type="checkbox" checked={preciseExport} onChange={(event) => setPreciseExport(event.target.checked)} disabled={isExporting} />
             Frame-accurate
           </label>
-          <button className="export-button" onClick={exportCompilation} disabled={!file || clips.length === 0 || isExporting}>
+          <button className="export-button" onClick={exportCompilation} disabled={!canExport || isExporting} title={clips.length ? 'Export your plays as one video' : 'Join all files into one video'}>
             {isExporting ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}
-            {isExporting ? `Export ${exportProgress}%` : 'Export video'}
+            {isExporting ? `Export ${exportProgress}%` : clips.length || sources.length < 2 ? 'Export video' : 'Export joined'}
           </button>
         </div>
       </header>
@@ -295,10 +378,11 @@ export default function App() {
               <div className="eyebrow"><span>01</span> / GAME FILM</div>
               <h1>Cut the dead time. <em>Keep the game.</em></h1>
             </div>
-            <button className="source-button" onClick={() => fileInput.current?.click()}>
-              <FolderOpen size={16} /> {file ? 'Replace footage' : 'Add game footage'}
+            <button className="source-button" onClick={() => fileInput.current?.click()} disabled={isLoadingFootage}>
+              {isLoadingFootage ? <LoaderCircle size={16} className="spin" /> : <FolderOpen size={16} />} {sources.length ? 'Replace footage' : 'Add game footage'}
             </button>
-            <input ref={fileInput} className="visually-hidden" type="file" accept="video/mp4,.mp4" onChange={() => openVideo()} />
+            <input ref={fileInput} className="visually-hidden" type="file" accept="video/mp4,.mp4" multiple onChange={(event) => addFootage(event.target.files, false)} />
+            <input ref={appendInput} className="visually-hidden" type="file" accept="video/mp4,.mp4" multiple onChange={(event) => addFootage(event.target.files, true)} />
           </div>
 
           {(errorMessage || exportMessage) && (
@@ -309,12 +393,37 @@ export default function App() {
             </div>
           )}
 
-          {file && (
+          {sources.length > 0 && (
+            <section className="footage-bar" aria-label="Game footage files">
+              <span className="section-kicker">FOOTAGE</span>
+              <ol className="footage-list">
+                {sources.map((source, index) => (
+                  <li key={source.id} className={`footage-chip ${index === activeIndex ? 'footage-chip-active' : ''}`}>
+                    <button className="footage-name" onClick={() => seek(source.offset)} title={`${source.file.name} · starts at ${formatTime(source.offset)}`}>
+                      <span className="footage-index">{index + 1}</span>
+                      <span className="footage-file">{source.file.name}</span>
+                      <span className="footage-length">{formatTime(source.duration)}</span>
+                    </button>
+                    {sources.length > 1 && (
+                      <>
+                        <button className="footage-action" onClick={() => moveSource(index, -1)} disabled={index === 0} aria-label={`Move ${source.file.name} earlier`}><ArrowLeft size={12} /></button>
+                        <button className="footage-action" onClick={() => moveSource(index, 1)} disabled={index === sources.length - 1} aria-label={`Move ${source.file.name} later`}><ArrowRight size={12} /></button>
+                      </>
+                    )}
+                    <button className="footage-action footage-remove" onClick={() => removeSource(index)} aria-label={`Remove ${source.file.name}`}><X size={12} /></button>
+                  </li>
+                ))}
+              </ol>
+              <button className="footage-add" onClick={() => appendInput.current?.click()} disabled={isLoadingFootage}><Plus size={13} /> Add file</button>
+            </section>
+          )}
+
+          {sources.length > 0 && (
             <section className="autocut" aria-label="Automatic dead-time removal">
               <div className="autocut-copy">
                 <span className="section-kicker">AUTO-CUT</span>
                 <h2>Remove dead time</h2>
-                <p>{track ? 'Lime areas are kept. Drag the sliders until only live play is lime, then apply.' : 'Scans the whole game for movement and keeps the stretches where play is live. Runs on this device.'}</p>
+                <p>{track ? 'Lime areas are kept. Drag the sliders until only live play is lime, then apply.' : `Scans ${sources.length > 1 ? `all ${sources.length} files` : 'the whole game'} for movement and keeps the stretches where play is live. Runs on this device.`}</p>
               </div>
               {analysisProgress !== null ? (
                 <div className="autocut-scan">
@@ -359,37 +468,38 @@ export default function App() {
           <section className="workbench" aria-label="Video editor">
             <div className="preview-column">
               <div className="preview-heading">
-                <div><span className="section-kicker">SOURCE MONITOR</span><span className="source-name">{file?.name ?? 'No game footage loaded'}</span></div>
-                {file && <span className="format-pill">MP4 <span>·</span> {formatTime(duration)}</span>}
+                <div><span className="section-kicker">SOURCE MONITOR</span><span className="source-name">{active ? `${active.file.name}${sources.length > 1 ? ` · file ${activeIndex + 1} of ${sources.length}` : ''}` : 'No game footage loaded'}</span></div>
+                {active && <span className="format-pill">{sources.length > 1 ? `${sources.length} FILES` : 'MP4'} <span>·</span> {formatTime(duration)}</span>}
               </div>
-              <div className={`video-stage ${!videoUrl ? 'is-empty' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); openVideo(event.dataTransfer.files[0]) }}>
-                {videoUrl ? (
+              <div className={`video-stage ${!active ? 'is-empty' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFootage(event.dataTransfer.files, sources.length > 0) }}>
+                {active ? (
                   <video
+                    key={active.id}
                     ref={videoRef}
-                    src={videoUrl}
-                    onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
+                    src={active.url}
+                    onLoadedMetadata={(event) => handleLoaded(event.currentTarget)}
                     onTimeUpdate={(event) => handleTimeUpdate(event.currentTarget)}
                     onPlay={() => setIsPlaying(true)}
-                    onPause={() => setIsPlaying(false)}
-                    onEnded={() => setIsPlaying(false)}
+                    onPause={(event) => { if (!event.currentTarget.ended) setIsPlaying(false) }}
+                    onEnded={handleEnded}
                     playsInline
                   />
                 ) : (
-                  <button className="empty-upload" onClick={() => fileInput.current?.click()}>
-                    <span className="upload-icon"><Upload size={21} /></span>
-                    <strong>Drop in the full game</strong>
-                    <span>MP4 footage · processed on this device</span>
+                  <button className="empty-upload" onClick={() => fileInput.current?.click()} disabled={isLoadingFootage}>
+                    <span className="upload-icon">{isLoadingFootage ? <LoaderCircle size={21} className="spin" /> : <Upload size={21} />}</span>
+                    <strong>{isLoadingFootage ? 'Reading footage…' : 'Drop in the full game'}</strong>
+                    <span>One MP4 or several · they play back to back · processed on this device</span>
                     <span className="browse-link">Browse files <ChevronDown size={13} className="browse-arrow" /></span>
                   </button>
                 )}
-                {videoUrl && <span className="timecode">{formatPreciseTime(currentTime)} <i>/</i> {formatTime(duration)}</span>}
+                {active && <span className="timecode">{formatPreciseTime(currentTime)} <i>/</i> {formatTime(duration)}</span>}
               </div>
               <div className="transport">
-                <button className="transport-play" onClick={() => videoRef.current?.paused ? videoRef.current.play() : videoRef.current?.pause()} disabled={!videoUrl} aria-label={isPlaying ? 'Pause video' : 'Play video'}>
+                <button className="transport-play" onClick={() => videoRef.current?.paused ? videoRef.current.play() : videoRef.current?.pause()} disabled={!active} aria-label={isPlaying ? 'Pause video' : 'Play video'}>
                   {isPlaying ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}
                 </button>
                 <span className="transport-time">{formatPreciseTime(currentTime)}</span>
-                <input className="scrubber" aria-label="Scrub video" type="range" min="0" max={duration || 1} step="0.1" value={Math.min(currentTime, duration || 0)} disabled={!videoUrl} onChange={(event) => seek(Number(event.target.value))} />
+                <input className="scrubber" aria-label="Scrub video" type="range" min="0" max={duration || 1} step="0.1" value={Math.min(currentTime, duration || 0)} disabled={!active} onChange={(event) => seek(Number(event.target.value))} />
                 <span className="transport-time muted">{formatTime(duration)}</span>
                 <button className={`skip-toggle ${skipDeadTime ? 'skip-toggle-on' : ''}`} onClick={() => setSkipDeadTime((value) => !value)} disabled={clips.length === 0} aria-pressed={skipDeadTime} title="Skip everything outside your plays while watching">
                   <SkipForward size={13} /> Skip dead time
@@ -400,7 +510,7 @@ export default function App() {
                 {clips.map((clip) => <button key={clip.id} title={`${clip.title} · ${formatTime(clip.start)}`} style={{ left: `${duration ? (clip.start / duration) * 100 : 0}%` }} className={`marker ${selectedId === clip.id ? 'marker-active' : ''}`} onClick={() => { setSelectedId(clip.id); seek(clip.start) }} />)}
               </div>
               <div className="source-footer">
-                <span><Clock3 size={14} /> {file ? `${formatTime(duration)} source length` : 'Full-length source video'}</span>
+                <span><Clock3 size={14} /> {sources.length ? `${formatTime(duration)} total${sources.length > 1 ? ` across ${sources.length} files` : ''}` : 'Full-length source video'}</span>
                 <span><Sparkles size={14} /> Local editing</span>
               </div>
             </div>
@@ -408,7 +518,7 @@ export default function App() {
             <aside className="clip-sidebar">
               <div className="sidebar-heading">
                 <div><span className="section-kicker">PLAYBOOK</span><h2>Your plays <span className="count-badge">{clips.length}</span></h2></div>
-                <button className="icon-button add-button" onClick={addClip} disabled={!videoUrl} title="Mark play at current time"><Plus size={17} /></button>
+                <button className="icon-button add-button" onClick={addClip} disabled={!active} title="Mark play at current time"><Plus size={17} /></button>
               </div>
               <p className="sidebar-help">Auto-cut fills this list. Trim, rename, or remove any play.</p>
               <div className="clip-list">
@@ -441,21 +551,22 @@ export default function App() {
               )}
               <div className="sidebar-bottom">
                 <div className="reel-total"><span>CUT LENGTH</span><strong>{formatTime(totalSelected)}</strong></div>
-                <button className="add-play-button" onClick={addClip} disabled={!videoUrl}><Plus size={15} /> Mark a play <span>at playhead</span></button>
+                <button className="add-play-button" onClick={addClip} disabled={!active}><Plus size={15} /> Mark a play <span>at playhead</span></button>
               </div>
             </aside>
           </section>
 
           <section className="timeline-section">
             <div className="timeline-heading"><div><span className="section-kicker">EDIT TIMELINE</span><h2>Game sequence</h2></div><span className="timeline-note">{clips.length} {clips.length === 1 ? 'play' : 'plays'} <i>·</i> {formatTime(totalSelected)} total</span></div>
-            <div className={`timeline-ruler ${!file ? 'timeline-disabled' : ''}`}>
+            <div className={`timeline-ruler ${!sources.length ? 'timeline-disabled' : ''}`}>
               <div className="ruler-labels"><span>00:00</span><span>{formatTime(duration / 2)}</span><span>{formatTime(duration)}</span></div>
               <div className="ruler-track">
                 <div className="source-track" />
+                {sources.slice(1).map((source) => <span key={source.id} className="file-boundary" style={{ left: `${(source.offset / duration) * 100}%` }} title={`${source.file.name} starts`} />)}
                 {clips.map((clip, index) => <button key={clip.id} className={`timeline-clip ${tagClass[clip.tag]} ${selectedId === clip.id ? 'timeline-clip-active' : ''}`} style={{ left: `${duration ? (clip.start / duration) * 100 : 0}%`, width: `${duration ? Math.max((clip.end - clip.start) / duration * 100, 0.4) : 0}%` }} onClick={() => { setSelectedId(clip.id); seek(clip.start) }} title={`${index + 1}. ${clip.title}`}><span>{clip.title}</span></button>)}
-                {file && <span className="playhead" style={{ left: `${duration ? (currentTime / duration) * 100 : 0}%` }} />}
+                {active && <span className="playhead" style={{ left: `${duration ? (currentTime / duration) * 100 : 0}%` }} />}
               </div>
-              <div className="timeline-foot"><span><i className="legend-source" /> Full game</span><span><i className="legend-selected" /> Kept plays</span><span className="timeline-foot-spacer" /><span>{file ? file.name : 'Import a video to get started'}</span></div>
+              <div className="timeline-foot"><span><i className="legend-source" /> Full game</span><span><i className="legend-selected" /> Kept plays</span>{sources.length > 1 && <span><i className="legend-boundary" /> File break</span>}<span className="timeline-foot-spacer" /><span>{sources.length ? sources.map((source) => source.file.name).join(' + ') : 'Import a video to get started'}</span></div>
             </div>
           </section>
 

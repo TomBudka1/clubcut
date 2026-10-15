@@ -206,6 +206,21 @@ h1 em { color: var(--lime); font-style: normal; }
 .tag-option-active.live { border-color: #556b8c; color: #d3e0f3; background: #222b38; }
 .timeline-clip { min-width: 3px; padding: 0 4px; }
 .timeline-clip.live { border-color: #5b7193; color: #d3e0f3; background: #2a3546; }
+.footage-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.footage-list { min-width: 0; display: flex; flex: 1; gap: 6px; margin: 0; padding: 0 0 2px; overflow-x: auto; list-style: none; }
+.footage-chip { display: flex; flex: 0 0 auto; align-items: center; border: 1px solid #353e36; border-radius: 4px; background: #191e1a; }
+.footage-chip-active { border-color: #687a50; background: #222a1f; }
+.footage-name { max-width: 260px; display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 0; background: transparent; font-size: 11px; cursor: pointer; }
+.footage-index { color: var(--lime); font: 10px var(--mono); }
+.footage-file { overflow: hidden; color: #d6ddd5; text-overflow: ellipsis; white-space: nowrap; }
+.footage-length { color: #7f8a80; font: 9px var(--mono); }
+.footage-action { width: 22px; height: 26px; display: grid; place-items: center; padding: 0; border: 0; border-left: 1px solid #2d352e; color: #8f9a90; background: transparent; cursor: pointer; }
+.footage-action:hover:not(:disabled) { color: var(--lime); }
+.footage-remove:hover:not(:disabled) { color: #ff9f83; }
+.footage-add { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px dashed #4b5948; border-radius: 4px; color: var(--lime); background: transparent; font-size: 11px; cursor: pointer; }
+.footage-add:hover:not(:disabled) { background: #222a1f; }
+.file-boundary { position: absolute; z-index: 1; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--orange); pointer-events: none; }
+.legend-boundary { width: 0; height: 9px; border-left: 1px dashed var(--orange); }
 .spin { animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -229,6 +244,9 @@ h1 em { color: var(--lime); font-style: normal; }
   .project-label { margin-left: 22px; font-size: 8px; }
   .top-actions { gap: 8px; }
   .save-state, .export-mode { display: none; }
+  .footage-bar { flex-wrap: wrap; gap: 8px; }
+  .footage-bar .section-kicker { width: 100%; }
+  .footage-name { max-width: 190px; }
   .autocut-settings { grid-template-columns: 1fr; gap: 12px; }
   .skip-toggle { padding: 4px 5px; }
   .export-button { height: 32px; padding: 0 9px; font-size: 10px; }
