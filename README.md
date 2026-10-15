@@ -13,6 +13,21 @@ npm run dev
 
 Open the local URL printed by Vite. The development server sets the cross-origin isolation headers required by the FFmpeg worker. The first export downloads the FFmpeg core from jsDelivr, so an internet connection is required for that first load.
 
+## Publish updates
+
+The live site is https://tombudka1.github.io/clubcut/, served by GitHub Pages from the `gh-pages` branch. After changing the code:
+
+```sh
+git add -A
+git commit -m "Describe the change"
+git push
+npm run deploy
+```
+
+`git push` saves the source code to GitHub. `npm run deploy` builds the site and publishes it, and the live page updates about a minute later.
+
+GitHub Pages can't send the cross-origin isolation headers FFmpeg needs, so `public/coi-serviceworker.js` adds them in the browser. Each visitor's first page load reloads once while it installs.
+
 ## Games split across several files
 
 Many cameras start a new file every ~4 GB or ~12 minutes, and some teams record each half separately. Select or drop all of the MP4s at once. ClubCut sorts them by filename, which keeps camera chapter order such as GH010042, GH020042, and plays them back to back as one game. Use the arrows on each file in the **Footage** bar to fix the order, the × to remove a file, or **Add file** to append more. Dashed orange lines on the timeline mark where one file ends and the next begins.
